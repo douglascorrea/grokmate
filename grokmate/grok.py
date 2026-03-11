@@ -163,51 +163,76 @@ _UI_CHROME: frozenset[str] = frozenset({
     "Private Chat", "This chat won't appear in history and will be fully erased",
     "Start dictation",
 })
-# Minimum character length to be considered a content string (not a label)
-_MIN_CONTENT_LEN = 15
 
 
 def _is_content_text(text: str) -> bool:
-    """Return True if text looks like actual content (not UI chrome)."""
+    """Return True if text looks like actual content (not UI chrome).
+
+    Excludes only known UI chrome strings and very short strings (≤ 3 chars)
+    that are typically icons or single-letter labels. This intentionally allows
+    short bullet-point items through.
+    """
     t = text.strip()
     if not t:
         return False
     if t in _UI_CHROME:
         return False
-    if len(t) < _MIN_CONTENT_LEN:
-        return False
-    # Skip things that are clearly suggestion chips (short phrases ending with ?)
-    # or timestamps / page-count indicators like "40 pages"
-    if len(t.split()) <= 4 and not t.endswith("."):
+    if len(t) <= 3:
         return False
     return True
+
+
+def _read_visible_texts(d: object) -> list[str]:
+    """Read all non-empty text from visible TextViews."""
+    elements = d(className="android.widget.TextView")  # type: ignore[operator]
+    texts: list[str] = []
+    for i in range(elements.count):
+        try:
+            t = elements[i].get_text()
+            if t:
+                texts.append(t.strip())
+        except Exception:
+            continue
+    return texts
 
 
 def read_response(device: object) -> str:
     """Read the assistant's response by extracting TextViews from the chat.
 
     Strategy:
-    1. Read current screen TextViews, filtering out UI chrome.
-    2. Scroll up to reveal any earlier content that was pushed off-screen.
-    3. Continue until content stabilises (same texts for N consecutive reads).
-    4. Return the longest/most substantial content block (the Grok response).
+    1. Scroll UP to the top of the conversation (Grok appends at the bottom,
+       so a long response may extend below the fold).
+    2. Scroll DOWN, accumulating all visible content TextViews.
+    3. Filter out UI chrome via ``_is_content_text()``.
+    4. Stop scrolling when content stabilises (no new text for N reads).
+    5. Return all content blocks joined by double newlines.
     """
     d = device  # type: ignore[assignment]
-    all_content: list[str] = []
+
+    # ── Phase 1: scroll to the top of the conversation ──────────────────
     seen_snapshots: set[str] = set()
     stable_count = 0
+    for _ in range(20):  # safety cap
+        texts = _read_visible_texts(d)
+        snapshot = "|".join(texts)
+        if snapshot in seen_snapshots:
+            stable_count += 1
+            if stable_count >= SCROLL_STABILISE_ROUNDS:
+                break
+        else:
+            stable_count = 0
+            seen_snapshots.add(snapshot)
 
-    for _ in range(30):  # safety cap on scroll iterations
-        elements = d(className="android.widget.TextView")
-        texts = []
-        for i in range(elements.count):
-            try:
-                t = elements[i].get_text()
-                if t and _is_content_text(t):
-                    texts.append(t.strip())
-            except Exception:
-                continue
+        # Swipe finger down → content scrolls up → reveals earlier content
+        d.swipe_ext("down", scale=0.5)
+        time.sleep(0.5)
 
+    # ── Phase 2: scroll down, accumulating all content ──────────────────
+    all_content: list[str] = []
+    seen_snapshots = set()
+    stable_count = 0
+    for _ in range(30):  # safety cap
+        texts = _read_visible_texts(d)
         snapshot = "|".join(texts)
         if snapshot in seen_snapshots:
             stable_count += 1
@@ -217,18 +242,17 @@ def read_response(device: object) -> str:
             stable_count = 0
             seen_snapshots.add(snapshot)
             for t in texts:
-                if t not in all_content:
+                if _is_content_text(t) and t not in all_content:
                     all_content.append(t)
 
-        # Scroll up to reveal content above the fold
-        d.swipe_ext("down", scale=0.5)
+        # Swipe finger up → content scrolls down → reveals later content
+        d.swipe_ext("up", scale=0.5)
         time.sleep(0.5)
 
     if not all_content:
         return ""
 
-    # Return the longest content block — typically the Grok response
-    return max(all_content, key=len)
+    return "\n\n".join(all_content)
 
 
 def extract_full_response(device: object) -> str:
