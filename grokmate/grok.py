@@ -12,9 +12,10 @@ import time
 from typing import Optional, Protocol
 
 # Resource IDs observed in the Grok app (ai.x.grok)
-RES_CHAT_INPUT = "ai.x.grok:id/chat_text_input"
-RES_SEND_BUTTON = "ai.x.grok:id/input_send_button"
-RES_TOP_BAR = "ai.x.grok:id/conversation_top_bar"
+# NOTE: Grok uses bare resource IDs (React Native style) — no package prefix.
+RES_CHAT_INPUT = "chat_text_input"
+RES_SEND_BUTTON = "input_send_button"
+RES_TOP_BAR = "conversation_top_bar"
 NEW_CHAT_DESC = "Start new chat"
 
 # Strings shown while Grok is processing
@@ -48,43 +49,85 @@ def connect_device(serial: Optional[str] = None) -> object:
     return u2.connect()
 
 
-def tap_new_chat(device: object) -> None:
-    """Tap the 'Start new chat' button."""
+def tap_new_chat(device: object, wait_timeout: int = 8) -> None:
+    """Tap the 'Start new chat' button and wait for the input field to appear."""
     d = device  # type: ignore[assignment]
     btn = d(description=NEW_CHAT_DESC)
     if btn.exists():
         btn.click()
-        time.sleep(1.0)
     else:
         raise RuntimeError(
             f"Could not find '{NEW_CHAT_DESC}' button. Is Grok open?"
         )
 
+    # Wait for the chat input field to appear (new chat screen fully loaded)
+    start = time.monotonic()
+    while time.monotonic() - start < wait_timeout:
+        if (
+            d(resourceId=RES_CHAT_INPUT).exists()
+            or d(resourceId=f"ai.x.grok:id/{RES_CHAT_INPUT}").exists()
+            or d(className="android.widget.EditText").exists()
+        ):
+            time.sleep(0.3)
+            return
+        time.sleep(0.3)
+    raise RuntimeError(
+        f"Chat input field did not appear within {wait_timeout}s after tapping new chat."
+    )
 
-def send_message(device: object, text: str) -> None:
+
+def _find_chat_input(d: object, wait_timeout: int = 15) -> object:
+    """Find the chat input EditText, trying multiple selectors.
+
+    Grok uses bare resource IDs (React Native style). uiautomator2's
+    resourceId selector requires full package-prefixed IDs in the underlying
+    UIAutomator Java API, so we fall back to class-based lookup.
+    """
+    d = d  # type: ignore[assignment]
+    start = time.monotonic()
+    while time.monotonic() - start < wait_timeout:
+        # Try 1: full package-prefixed resource ID
+        el = d(resourceId=f"ai.x.grok:id/{RES_CHAT_INPUT}")  # type: ignore[operator]
+        if el.exists():
+            return el
+        # Try 2: bare resource ID (some u2 versions accept this)
+        el = d(resourceId=RES_CHAT_INPUT)  # type: ignore[operator]
+        if el.exists():
+            return el
+        # Try 3: EditText class (there is only one on the chat screen)
+        el = d(className="android.widget.EditText")  # type: ignore[operator]
+        if el.exists():
+            return el
+        time.sleep(0.5)
+    raise RuntimeError(
+        f"Chat input field not found after {wait_timeout}s. "
+        "Is Grok open and on a chat screen?"
+    )
+
+
+def send_message(device: object, text: str, wait_timeout: int = 15) -> None:
     """Type a message using set_text (bypasses keyboard) and tap send.
 
     This is the critical path — we intentionally avoid `adb shell input text`
     because Samsung's HoneyBoard autocorrect mangles input.
+
+    Waits up to `wait_timeout` seconds for the input field to appear
+    (handles the case where the app is still animating into view).
     """
     d = device  # type: ignore[assignment]
 
-    # Find the chat input field by resource-id
-    input_field = d(resourceId=RES_CHAT_INPUT)
-    if not input_field.exists():
-        raise RuntimeError(
-            f"Chat input field ({RES_CHAT_INPUT}) not found. Is Grok open?"
-        )
+    input_field = _find_chat_input(d, wait_timeout=wait_timeout)
 
     # Set text directly — no keyboard involvement
     input_field.set_text(text)
+    time.sleep(0.3)  # brief settle before tapping send
 
-    # Tap send button
+    # Tap send button — try resource ID first, then content-desc fallback
     send_btn = d(resourceId=RES_SEND_BUTTON)
     if not send_btn.exists():
-        raise RuntimeError(
-            f"Send button ({RES_SEND_BUTTON}) not found."
-        )
+        send_btn = d(description="Send message")
+    if not send_btn.exists():
+        raise RuntimeError("Send button not found.")
     send_btn.click()
 
 
@@ -113,52 +156,79 @@ def wait_for_response(device: object, timeout: int = DEFAULT_TIMEOUT) -> None:
     )
 
 
+# UI chrome strings to exclude when extracting responses
+_UI_CHROME: frozenset[str] = frozenset({
+    "Ask", "Imagine", "Auto", "Speak", "Ask anything",
+    "Think Harder", "Quick Answer", "Search", "Temporary conversation",
+    "Private Chat", "This chat won't appear in history and will be fully erased",
+    "Start dictation",
+})
+# Minimum character length to be considered a content string (not a label)
+_MIN_CONTENT_LEN = 15
+
+
+def _is_content_text(text: str) -> bool:
+    """Return True if text looks like actual content (not UI chrome)."""
+    t = text.strip()
+    if not t:
+        return False
+    if t in _UI_CHROME:
+        return False
+    if len(t) < _MIN_CONTENT_LEN:
+        return False
+    # Skip things that are clearly suggestion chips (short phrases ending with ?)
+    # or timestamps / page-count indicators like "40 pages"
+    if len(t.split()) <= 4 and not t.endswith("."):
+        return False
+    return True
+
+
 def read_response(device: object) -> str:
     """Read the assistant's response by extracting TextViews from the chat.
 
-    Scrolls down and accumulates text until content stabilises (same text
-    seen for SCROLL_STABILISE_ROUNDS consecutive reads).
+    Strategy:
+    1. Read current screen TextViews, filtering out UI chrome.
+    2. Scroll up to reveal any earlier content that was pushed off-screen.
+    3. Continue until content stabilises (same texts for N consecutive reads).
+    4. Return the longest/most substantial content block (the Grok response).
     """
     d = device  # type: ignore[assignment]
-    collected_texts: list[str] = []
-    prev_snapshot = ""
+    all_content: list[str] = []
+    seen_snapshots: set[str] = set()
     stable_count = 0
 
     for _ in range(30):  # safety cap on scroll iterations
-        # Gather all visible TextViews
         elements = d(className="android.widget.TextView")
         texts = []
         for i in range(elements.count):
             try:
                 t = elements[i].get_text()
-                if t and t.strip():
+                if t and _is_content_text(t):
                     texts.append(t.strip())
             except Exception:
                 continue
 
-        snapshot = "\n".join(texts)
-        if snapshot == prev_snapshot:
+        snapshot = "|".join(texts)
+        if snapshot in seen_snapshots:
             stable_count += 1
             if stable_count >= SCROLL_STABILISE_ROUNDS:
                 break
         else:
             stable_count = 0
+            seen_snapshots.add(snapshot)
+            for t in texts:
+                if t not in all_content:
+                    all_content.append(t)
 
-        prev_snapshot = snapshot
-        collected_texts = texts
-
-        # Scroll down to reveal more content
-        d.swipe_ext("up", scale=0.5)
+        # Scroll up to reveal content above the fold
+        d.swipe_ext("down", scale=0.5)
         time.sleep(0.5)
 
-    if not collected_texts:
+    if not all_content:
         return ""
 
-    # The last text block(s) are typically the assistant's response.
-    # We return the last substantial block — skip UI chrome.
-    # Heuristic: take everything after the last occurrence of the user's
-    # message marker. For now, return the last collected text segment.
-    return collected_texts[-1] if collected_texts else ""
+    # Return the longest content block — typically the Grok response
+    return max(all_content, key=len)
 
 
 def extract_full_response(device: object) -> str:

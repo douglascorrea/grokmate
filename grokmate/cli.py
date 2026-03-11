@@ -113,9 +113,7 @@ def session_new(
     adb.launch_grok(serial)
     try:
         u2_dev = grok.connect_device(serial)
-        import time
-        time.sleep(2)  # let app fully load
-        grok.tap_new_chat(u2_dev)
+        grok.tap_new_chat(u2_dev)  # waits for chat_text_input to appear
     except Exception as e:
         console.print(f"[yellow]Warning:[/yellow] Could not tap new chat: {e}")
 
@@ -203,32 +201,36 @@ def _message_one_shot(conn: "db.sqlite3.Connection", text: str) -> None:
     device_info = adb.get_connected_device()
     serial = device_info.serial if device_info else None
 
-    # Launch & new chat
+    # Launch, connect u2, open a fresh chat — all before _send_and_receive
     adb.launch_grok(serial)
+    u2_dev = grok.connect_device(serial)
     try:
-        u2_dev = grok.connect_device(serial)
-        import time
-        time.sleep(2)
-        grok.tap_new_chat(u2_dev)
+        grok.tap_new_chat(u2_dev)  # waits for chat_text_input to appear
     except Exception as e:
         console.print(f"[yellow]Warning:[/yellow] Could not tap new chat: {e}")
 
     db.create_session(conn, session_id, name, device_serial=serial, status="active")
     # Do NOT update state.json — one-shot is isolated
 
-    _send_and_receive(conn, session_id, text)
+    # Pass already-connected u2_dev so _send_and_receive won't re-launch
+    _send_and_receive(conn, session_id, text, u2_dev=u2_dev)
 
     db.update_session_status(conn, session_id, "oneshot_done")
 
 
 def _send_and_receive(
-    conn: "db.sqlite3.Connection", session_id: str, text: str
+    conn: "db.sqlite3.Connection",
+    session_id: str,
+    text: str,
+    u2_dev: object = None,
 ) -> None:
     device_info = adb.get_connected_device()
     serial = device_info.serial if device_info else None
 
-    adb.launch_grok(serial)
-    u2_dev = grok.connect_device(serial)
+    if u2_dev is None:
+        # Only launch + connect when not already provided (in-session path)
+        adb.launch_grok(serial)
+        u2_dev = grok.connect_device(serial)
 
     # Send
     grok.send_message(u2_dev, text)

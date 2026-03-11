@@ -56,8 +56,10 @@ def is_grok_installed(serial: Optional[str] = None) -> bool:
         return False
 
 
-def launch_grok(serial: Optional[str] = None) -> None:
-    """Launch the Grok app (or bring to foreground)."""
+def launch_grok(serial: Optional[str] = None, wait_seconds: int = 5) -> None:
+    """Launch the Grok app (or bring to foreground) and wait until it's active."""
+    import time
+
     cmd = ["adb"]
     if serial:
         cmd += ["-s", serial]
@@ -71,6 +73,42 @@ def launch_grok(serial: Optional[str] = None) -> None:
         "1",
     ]
     subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+
+    # Wait until Grok is the foreground app
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        try:
+            fg_cmd = ["adb"]
+            if serial:
+                fg_cmd += ["-s", serial]
+            fg_cmd += ["shell", "dumpsys", "window", "windows"]
+            result = subprocess.run(fg_cmd, capture_output=True, text=True, timeout=5)
+            if GROK_PACKAGE in result.stdout:
+                time.sleep(0.5)  # brief extra settle time
+                return
+        except Exception:
+            pass
+        time.sleep(0.3)
+
+
+def get_foreground_package(serial: Optional[str] = None) -> str:
+    """Return the package name of the current foreground app."""
+    cmd = ["adb"]
+    if serial:
+        cmd += ["-s", serial]
+    cmd += ["shell", "dumpsys", "window", "windows"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        for line in result.stdout.splitlines():
+            if "mCurrentFocus" in line or "mFocusedApp" in line:
+                # Extract package/activity token
+                parts = line.split()
+                for part in parts:
+                    if "/" in part and not part.startswith("/"):
+                        return part.split("/")[0]
+    except Exception:
+        pass
+    return ""
 
 
 def scrcpy_available() -> bool:
