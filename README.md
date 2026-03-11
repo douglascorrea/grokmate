@@ -23,6 +23,7 @@ Grok doesn't have a public API. The obvious approach — `adb shell input text` 
 | **Android device** | USB debugging enabled, physically connected or on the same ADB network |
 | **Grok app** (`ai.x.grok`) | Installed on the device |
 | **uiautomator2** | Installed automatically as a dependency |
+| **Pillow** | Installed automatically as a dependency — used for screencap+crop fallback |
 
 Optional: [scrcpy](https://github.com/Genymobile/scrcpy) for the `check` command's screen mirror status.
 
@@ -66,7 +67,42 @@ grokmate session resume --session my-session
 | `grokmate check` | Preflight check — ADB, Grok app, uiautomator2, scrcpy | |
 | `grokmate session new` | Create a new Grok chat session | `--name` / `-n` — human-readable name |
 | `grokmate session resume` | Resume a previously created session | `--session` / `-s` — name or UUID prefix |
-| `grokmate message <text>` | Send a message and print Grok's response | `--one-shot` — throwaway session, no prior setup needed; `--timeout` / `-t` — seconds to wait for response (default: 120) |
+| `grokmate message <text>` | Send a message and print Grok's response | `--one-shot` — throwaway session, no prior setup needed; `--timeout` / `-t` — seconds to wait for response (default: 120); `--no-images` — skip image extraction |
+
+### Image extraction (`message` command)
+
+By default, after printing the text response, `grokmate message` scans the Grok
+UI for generated images and saves them locally.  Each extracted image is printed
+on its own line with an `IMAGE:` prefix:
+
+```
+$ grokmate message "Imagine a sunset over the ocean"
+Here is a beautiful image of a sunset...
+
+IMAGE:/Users/you/.grokmate/media/1710000000_grok_img_0.png
+```
+
+These `IMAGE:` lines can be captured by other tools (e.g. piped into a Telegram
+send command).
+
+Use `--no-images` to skip image extraction entirely:
+
+```bash
+grokmate message "Your question" --no-images
+```
+
+**How image extraction works:**
+
+1. After the text response is read, grokmate looks for large `ImageView` elements
+   (≥ 80 × 80 px) on screen — these are Grok-generated images.
+2. **Primary path:** long-press the image → tap *Save image* / *Download* from
+   the context menu → `adb pull` the saved file to `~/.grokmate/media/`.
+3. **Fallback:** if the context menu doesn't appear or save fails, grokmate takes
+   a full-screen screenshot via `adb exec-out screencap -p` and crops it to the
+   element's bounds using Pillow.
+
+Extracted images are stored in `~/.grokmate/media/` with filenames of the form
+`<timestamp>_grok_img_<index>.png`.
 
 ## How It Works
 
@@ -124,7 +160,9 @@ Data is stored in `~/.grokmate/`:
 ```
 ~/.grokmate/
 ├── grokmate.db    # SQLite database (sessions + messages)
-└── state.json     # Current active session tracking
+├── state.json     # Current active session tracking
+└── media/         # Extracted images (created on first use)
+    └── <timestamp>_grok_img_<n>.png
 ```
 
 ## Contributing

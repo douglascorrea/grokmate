@@ -8,7 +8,12 @@ writes directly into the field and bypasses the keyboard entirely.
 
 from __future__ import annotations
 
+import io
+import logging
+import re
+import subprocess
 import time
+from pathlib import Path
 from typing import Optional, Protocol
 
 # Resource IDs observed in the Grok app (ai.x.grok)
@@ -25,6 +30,42 @@ DEFAULT_TIMEOUT = 120  # seconds
 POLL_INTERVAL = 1.0  # seconds
 SCROLL_STABILISE_ROUNDS = 2  # consecutive identical reads before we stop
 
+# ── Image extraction constants ───────────────────────────────────────────────
+
+#: Default directory on the host where extracted images are stored.
+MEDIA_DIR: Path = Path.home() / ".grokmate" / "media"
+
+#: Context-menu strings to look for when saving an image (multi-locale).
+SAVE_MENU_TEXTS: frozenset[str] = frozenset({
+    "Save image",
+    "Save",
+    "Download",
+    "Guardar imagen",
+    "Guardar",
+    "Descargar",
+    "Save to device",
+    "Save photo",
+})
+
+#: Minimum pixel dimension (width *and* height) for an ImageView to be
+#: considered a generated image rather than an icon or avatar.
+MIN_IMAGE_DIMENSION: int = 80
+
+#: How long (seconds) to wait for a saved file to appear on the device.
+SAVE_WAIT_TIMEOUT: float = 20.0
+
+#: Directories on the device where Android apps typically save images.
+_DEVICE_SAVE_DIRS: tuple[str, ...] = (
+    "/sdcard/Pictures",
+    "/sdcard/Download",
+    "/sdcard/DCIM",
+    "/sdcard/DCIM/Screenshots",
+)
+
+_logger = logging.getLogger(__name__)
+
+# ── Protocols ────────────────────────────────────────────────────────────────
+
 
 class U2Device(Protocol):
     """Minimal interface we expect from a uiautomator2 device."""
@@ -40,6 +81,9 @@ class U2Element(Protocol):
     def get_text(self) -> str: ...
 
 
+# ── Device connection ────────────────────────────────────────────────────────
+
+
 def connect_device(serial: Optional[str] = None) -> object:
     """Connect uiautomator2 to the device. Returns a u2.Device."""
     import uiautomator2 as u2  # type: ignore[import-untyped]
@@ -47,6 +91,9 @@ def connect_device(serial: Optional[str] = None) -> object:
     if serial:
         return u2.connect(serial)
     return u2.connect()
+
+
+# ── Chat navigation ──────────────────────────────────────────────────────────
 
 
 def tap_new_chat(device: object, wait_timeout: int = 8) -> None:
@@ -259,3 +306,321 @@ def extract_full_response(device: object, timeout: int = DEFAULT_TIMEOUT) -> str
     """Convenience: wait for response, then read it."""
     wait_for_response(device, timeout=timeout)
     return read_response(device)
+
+
+# ── Image extraction ─────────────────────────────────────────────────────────
+
+
+def _get_media_dir() -> Path:
+    """Ensure ``~/.grokmate/media/`` exists and return its path."""
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    return MEDIA_DIR
+
+
+def _parse_bounds(bounds_raw: object) -> Optional[tuple[int, int, int, int]]:
+    """Parse element bounds into ``(left, top, right, bottom)``.
+
+    Handles two formats returned by uiautomator2:
+    - dict: ``{"left": x, "top": y, "right": x2, "bottom": y2}``
+    - str:  ``"[x,y][x2,y2]"``
+
+    Returns ``None`` if the bounds are missing or degenerate (zero-size).
+    """
+    if isinstance(bounds_raw, dict):
+        left = int(bounds_raw.get("left", 0))
+        top = int(bounds_raw.get("top", 0))
+        right = int(bounds_raw.get("right", 0))
+        bottom = int(bounds_raw.get("bottom", 0))
+    elif isinstance(bounds_raw, str):
+        nums = re.findall(r"\d+", bounds_raw)
+        if len(nums) < 4:
+            return None
+        left, top, right, bottom = int(nums[0]), int(nums[1]), int(nums[2]), int(nums[3])
+    else:
+        return None
+
+    width = right - left
+    height = bottom - top
+    if width < MIN_IMAGE_DIMENSION or height < MIN_IMAGE_DIMENSION:
+        return None  # too small — likely an icon, not a generated image
+
+    return (left, top, right, bottom)
+
+
+def find_image_views(device: object) -> list[tuple[int, int, int, int]]:
+    """Locate visible ``ImageView`` elements large enough to be generated images.
+
+    Returns a list of ``(left, top, right, bottom)`` tuples sorted by their
+    vertical position (top-to-bottom / visual reading order).  Only elements
+    whose width *and* height are ≥ ``MIN_IMAGE_DIMENSION`` pixels are included.
+    """
+    d = device  # type: ignore[assignment]
+    candidates: list[tuple[int, int, int, int]] = []
+
+    try:
+        elements = d(className="android.widget.ImageView")
+        count = elements.count
+    except Exception:
+        return []
+
+    for i in range(count):
+        try:
+            el = elements[i]
+            info = el.info
+            bounds_raw = info.get("bounds") if isinstance(info, dict) else None
+            if bounds_raw is None:
+                continue
+            bounds = _parse_bounds(bounds_raw)
+            if bounds is not None:
+                candidates.append(bounds)
+        except Exception:
+            continue
+
+    # Sort top-to-bottom
+    candidates.sort(key=lambda b: b[1])
+    return candidates
+
+
+def _adb_base(serial: Optional[str] = None) -> list[str]:
+    """Return ``["adb"]`` or ``["adb", "-s", serial]``."""
+    cmd = ["adb"]
+    if serial:
+        cmd += ["-s", serial]
+    return cmd
+
+
+def _list_device_files(path: str, serial: Optional[str] = None) -> list[str]:
+    """Return filenames in *path* on the device (newest first via ``ls -1t``)."""
+    cmd = _adb_base(serial) + ["shell", "ls", "-1t", path]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            return [f.strip() for f in result.stdout.strip().splitlines() if f.strip()]
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return []
+
+
+def _pull_newest_image(
+    device_dir: str,
+    before_files: set[str],
+    serial: Optional[str] = None,
+    label: str = "",
+    timeout: float = SAVE_WAIT_TIMEOUT,
+) -> Optional[Path]:
+    """Wait for a *new* image file to appear in *device_dir* and pull it.
+
+    Compares the directory listing against *before_files*, waits up to
+    *timeout* seconds, then ``adb pull``s the first new image found into
+    ``~/.grokmate/media/``.
+
+    Returns the host-side :class:`~pathlib.Path` on success, or ``None``.
+    """
+    media_dir = _get_media_dir()
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        current_files = set(_list_device_files(device_dir, serial))
+        new_files = current_files - before_files
+
+        image_exts = (".jpg", ".jpeg", ".png", ".webp", ".gif")
+        image_files = [f for f in new_files if f.lower().endswith(image_exts)]
+
+        if image_files:
+            device_path = f"{device_dir}/{image_files[0]}"
+            ts = int(time.time())
+            safe_label = re.sub(r"[^a-zA-Z0-9_-]", "_", label)[:20] if label else "grok"
+            host_filename = f"{ts}_{safe_label}_{image_files[0]}"
+            host_path = media_dir / host_filename
+
+            pull_cmd = _adb_base(serial) + ["pull", device_path, str(host_path)]
+            try:
+                result = subprocess.run(pull_cmd, capture_output=True, text=True, timeout=30)
+                if result.returncode == 0 and host_path.exists():
+                    return host_path
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+            return None  # found it but pull failed
+
+        time.sleep(0.5)
+
+    return None
+
+
+def _try_save_via_long_press(
+    device: object,
+    bounds: tuple[int, int, int, int],
+    serial: Optional[str] = None,
+) -> Optional[Path]:
+    """Primary path: long-press an image element to trigger the save menu.
+
+    Steps:
+    1. Snapshot current files in ``_DEVICE_SAVE_DIRS``.
+    2. Long-press the element's centre.
+    3. Look for a save/download menu item and tap it.
+    4. Poll for a new file to appear; pull it to host.
+
+    Returns the host-side :class:`~pathlib.Path` on success, or ``None``.
+    """
+    d = device  # type: ignore[assignment]
+    left, top, right, bottom = bounds
+    cx = (left + right) // 2
+    cy = (top + bottom) // 2
+
+    # Snapshot current device files before triggering the save
+    before_snapshots: dict[str, set[str]] = {
+        dir_path: set(_list_device_files(dir_path, serial))
+        for dir_path in _DEVICE_SAVE_DIRS
+    }
+
+    # Long-press at the image centre
+    try:
+        d.long_click(cx, cy)
+    except Exception:
+        try:
+            d.long_click(cx, cy, duration=1.0)
+        except Exception:
+            return None
+
+    time.sleep(1.0)  # wait for the context menu to appear
+
+    # Try to find and tap a save/download menu item (text-based)
+    saved = False
+    for label in SAVE_MENU_TEXTS:
+        try:
+            item = d(text=label)
+            if item.exists():
+                item.click()
+                saved = True
+                break
+        except Exception:
+            continue
+
+    # Content-description fallback (some ROMs use content-desc instead of text)
+    if not saved:
+        for label in SAVE_MENU_TEXTS:
+            try:
+                item = d(description=label)
+                if item.exists():
+                    item.click()
+                    saved = True
+                    break
+            except Exception:
+                continue
+
+    if not saved:
+        # Dismiss the menu (if any) and report failure
+        try:
+            d.press("back")
+        except Exception:
+            pass
+        return None
+
+    # Wait for the newly saved file and pull it to the host
+    for dir_path in _DEVICE_SAVE_DIRS:
+        path = _pull_newest_image(
+            dir_path,
+            before_snapshots[dir_path],
+            serial=serial,
+            timeout=SAVE_WAIT_TIMEOUT,
+        )
+        if path is not None:
+            return path
+
+    return None
+
+
+def _fallback_screencap_crop(
+    device: object,
+    bounds: tuple[int, int, int, int],
+    serial: Optional[str] = None,
+    index: int = 0,
+) -> Optional[Path]:
+    """Fallback: capture the full screen and crop to *bounds*.
+
+    First tries ``device.screenshot()`` (uiautomator2 built-in, returns a
+    PIL Image), then falls back to ``adb exec-out screencap -p`` + Pillow.
+
+    Returns the host-side :class:`~pathlib.Path` on success, or ``None``.
+    """
+    _logger.warning(
+        "Image extraction: falling back to screencap+crop for element at bounds %s",
+        bounds,
+    )
+
+    left, top, right, bottom = bounds
+    media_dir = _get_media_dir()
+    ts = int(time.time())
+    out_path = media_dir / f"{ts}_grok_img_{index}.png"
+
+    # ── Attempt 1: uiautomator2 device.screenshot() ──────────────────────
+    try:
+        d = device  # type: ignore[assignment]
+        screenshot = d.screenshot()
+        # u2 screenshot() returns a PIL Image object
+        if hasattr(screenshot, "crop"):
+            cropped = screenshot.crop((left, top, right, bottom))
+            cropped.save(str(out_path))
+            return out_path
+    except Exception:
+        pass
+
+    # ── Attempt 2: adb exec-out screencap -p ─────────────────────────────
+    try:
+        from PIL import Image  # type: ignore[import-untyped]
+
+        cmd = _adb_base(serial) + ["exec-out", "screencap", "-p"]
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
+        if result.returncode != 0 or not result.stdout:
+            return None
+
+        img = Image.open(io.BytesIO(result.stdout))
+        cropped = img.crop((left, top, right, bottom))
+        cropped.save(str(out_path))
+        return out_path
+
+    except ImportError:
+        _logger.error(
+            "Pillow not installed — cannot do screencap+crop fallback. "
+            "Install it with: pip install Pillow"
+        )
+    except Exception as exc:
+        _logger.warning("screencap+crop failed: %s", exc)
+
+    return None
+
+
+def extract_images(
+    device: object,
+    serial: Optional[str] = None,
+) -> list[Path]:
+    """Detect and extract generated images from the current Grok response.
+
+    For each ``ImageView`` found on screen that is large enough to be a
+    generated image (≥ ``MIN_IMAGE_DIMENSION`` px in both dimensions):
+
+    1. **Primary**: long-press → context-menu save → ``adb pull`` to host.
+    2. **Fallback**: ``screencap`` → Pillow crop → save to host.
+
+    All files land in ``~/.grokmate/media/``.
+
+    Returns a list of absolute host-side :class:`~pathlib.Path` objects
+    (may be empty if no images were found or all extractions failed).
+    """
+    bounds_list = find_image_views(device)
+    if not bounds_list:
+        return []
+
+    paths: list[Path] = []
+    for i, bounds in enumerate(bounds_list):
+        # Primary: long-press save
+        path = _try_save_via_long_press(device, bounds, serial=serial)
+
+        if path is None:
+            # Fallback: screencap + crop
+            path = _fallback_screencap_crop(device, bounds, serial=serial, index=i)
+
+        if path is not None:
+            paths.append(path)
+
+    return paths

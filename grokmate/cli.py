@@ -171,20 +171,43 @@ def message(
         "-t",
         help="Seconds to wait for Grok's response before giving up (default: 120).",
     ),
+    no_images: bool = typer.Option(
+        False,
+        "--no-images",
+        help=(
+            "Skip image extraction. By default, grokmate attempts to save any "
+            "generated images from Grok to ~/.grokmate/media/ and prints "
+            "IMAGE:/path/to/file lines to stdout."
+        ),
+    ),
 ) -> None:
-    """Send a message to Grok and print the response."""
+    """Send a message to Grok and print the response.
+
+    If Grok generated images, each image is saved to ~/.grokmate/media/ and
+    its path is printed on a separate line prefixed with ``IMAGE:``, e.g.::
+
+        IMAGE:/Users/you/.grokmate/media/1234567890_grok_img_0.png
+
+    Use ``--no-images`` to disable image extraction entirely.
+    """
     conn = _get_conn()
 
+    extract_images = not no_images
+
     if one_shot:
-        _message_one_shot(conn, text, timeout=timeout)
+        _message_one_shot(conn, text, timeout=timeout, extract_images=extract_images)
     else:
-        _message_in_session(conn, text, timeout=timeout)
+        _message_in_session(conn, text, timeout=timeout, extract_images=extract_images)
 
     conn.close()
 
 
 def _message_in_session(
-    conn: "db.sqlite3.Connection", text: str, *, timeout: int = 120
+    conn: "db.sqlite3.Connection",
+    text: str,
+    *,
+    timeout: int = 120,
+    extract_images: bool = True,
 ) -> None:
     session_id = state.read_current_session(_state_path)
     if not session_id:
@@ -199,11 +222,17 @@ def _message_in_session(
         console.print(f"[red]Session {session_id} not found in DB.[/red]")
         raise typer.Exit(code=1)
 
-    _send_and_receive(conn, session_id, text, timeout=timeout)
+    _send_and_receive(
+        conn, session_id, text, timeout=timeout, extract_images=extract_images
+    )
 
 
 def _message_one_shot(
-    conn: "db.sqlite3.Connection", text: str, *, timeout: int = 120
+    conn: "db.sqlite3.Connection",
+    text: str,
+    *,
+    timeout: int = 120,
+    extract_images: bool = True,
 ) -> None:
     session_id = str(uuid.uuid4())
     name = f"oneshot-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
@@ -223,7 +252,14 @@ def _message_one_shot(
     # Do NOT update state.json — one-shot is isolated
 
     # Pass already-connected u2_dev so _send_and_receive won't re-launch
-    _send_and_receive(conn, session_id, text, u2_dev=u2_dev, timeout=timeout)
+    _send_and_receive(
+        conn,
+        session_id,
+        text,
+        u2_dev=u2_dev,
+        timeout=timeout,
+        extract_images=extract_images,
+    )
 
     db.update_session_status(conn, session_id, "oneshot_done")
 
@@ -234,6 +270,7 @@ def _send_and_receive(
     text: str,
     u2_dev: object = None,
     timeout: int = 120,
+    extract_images: bool = True,
 ) -> None:
     device_info = adb.get_connected_device()
     serial = device_info.serial if device_info else None
@@ -247,9 +284,24 @@ def _send_and_receive(
     grok.send_message(u2_dev, text)
     db.add_message(conn, session_id, "user", text)
 
-    # Wait & read
+    # Wait & read text response
     response = grok.extract_full_response(u2_dev, timeout=timeout)
     db.add_message(conn, session_id, "assistant", response)
 
-    # Print to stdout
+    # Print text to stdout
     console.print(response)
+
+    # ── Image extraction ──────────────────────────────────────────────────
+    if extract_images:
+        try:
+            image_paths = grok.extract_images(u2_dev, serial=serial)
+        except Exception as exc:
+            console.print(
+                f"[yellow]Warning:[/yellow] image extraction failed: {exc}",
+                file=sys.stderr,
+            )
+            image_paths = []
+
+        for img_path in image_paths:
+            # Print to stdout so callers can capture IMAGE: lines
+            print(f"IMAGE:{img_path.resolve()}")
