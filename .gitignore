@@ -26,3 +26,8 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# grokmate runtime data (never commit user DB or session state)
+~/.grokmate/
+*.db
+state.json
