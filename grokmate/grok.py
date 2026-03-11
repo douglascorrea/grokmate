@@ -21,7 +21,7 @@ NEW_CHAT_DESC = "Start new chat"
 # Strings shown while Grok is processing
 LOADING_INDICATORS = frozenset({"Reading posts", "Thinking…", "Thinking..."})
 
-DEFAULT_TIMEOUT = 60  # seconds
+DEFAULT_TIMEOUT = 120  # seconds
 POLL_INTERVAL = 1.0  # seconds
 SCROLL_STABILISE_ROUNDS = 2  # consecutive identical reads before we stop
 
@@ -255,7 +255,7 @@ def read_response(device: object) -> str:
     return "\n\n".join(all_content)
 
 
-def extract_full_response(device: object) -> str:
+def extract_full_response(device: object, timeout: int = DEFAULT_TIMEOUT) -> str:
     """Convenience: wait for response, then read it."""
-    wait_for_response(device)
+    wait_for_response(device, timeout=timeout)
     return read_response(device)

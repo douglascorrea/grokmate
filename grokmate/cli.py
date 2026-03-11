@@ -165,19 +165,27 @@ def message(
     one_shot: bool = typer.Option(
         False, "--one-shot", help="Create a throwaway session for this message."
     ),
+    timeout: int = typer.Option(
+        120,
+        "--timeout",
+        "-t",
+        help="Seconds to wait for Grok's response before giving up (default: 120).",
+    ),
 ) -> None:
     """Send a message to Grok and print the response."""
     conn = _get_conn()
 
     if one_shot:
-        _message_one_shot(conn, text)
+        _message_one_shot(conn, text, timeout=timeout)
     else:
-        _message_in_session(conn, text)
+        _message_in_session(conn, text, timeout=timeout)
 
     conn.close()
 
 
-def _message_in_session(conn: "db.sqlite3.Connection", text: str) -> None:
+def _message_in_session(
+    conn: "db.sqlite3.Connection", text: str, *, timeout: int = 120
+) -> None:
     session_id = state.read_current_session(_state_path)
     if not session_id:
         console.print(
@@ -191,10 +199,12 @@ def _message_in_session(conn: "db.sqlite3.Connection", text: str) -> None:
         console.print(f"[red]Session {session_id} not found in DB.[/red]")
         raise typer.Exit(code=1)
 
-    _send_and_receive(conn, session_id, text)
+    _send_and_receive(conn, session_id, text, timeout=timeout)
 
 
-def _message_one_shot(conn: "db.sqlite3.Connection", text: str) -> None:
+def _message_one_shot(
+    conn: "db.sqlite3.Connection", text: str, *, timeout: int = 120
+) -> None:
     session_id = str(uuid.uuid4())
     name = f"oneshot-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
 
@@ -213,7 +223,7 @@ def _message_one_shot(conn: "db.sqlite3.Connection", text: str) -> None:
     # Do NOT update state.json — one-shot is isolated
 
     # Pass already-connected u2_dev so _send_and_receive won't re-launch
-    _send_and_receive(conn, session_id, text, u2_dev=u2_dev)
+    _send_and_receive(conn, session_id, text, u2_dev=u2_dev, timeout=timeout)
 
     db.update_session_status(conn, session_id, "oneshot_done")
 
@@ -223,6 +233,7 @@ def _send_and_receive(
     session_id: str,
     text: str,
     u2_dev: object = None,
+    timeout: int = 120,
 ) -> None:
     device_info = adb.get_connected_device()
     serial = device_info.serial if device_info else None
@@ -237,7 +248,7 @@ def _send_and_receive(
     db.add_message(conn, session_id, "user", text)
 
     # Wait & read
-    response = grok.extract_full_response(u2_dev)
+    response = grok.extract_full_response(u2_dev, timeout=timeout)
     db.add_message(conn, session_id, "assistant", response)
 
     # Print to stdout

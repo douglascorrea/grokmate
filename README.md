@@ -66,7 +66,7 @@ grokmate session resume --session my-session
 | `grokmate check` | Preflight check — ADB, Grok app, uiautomator2, scrcpy | |
 | `grokmate session new` | Create a new Grok chat session | `--name` / `-n` — human-readable name |
 | `grokmate session resume` | Resume a previously created session | `--session` / `-s` — name or UUID prefix |
-| `grokmate message <text>` | Send a message and print Grok's response | `--one-shot` — throwaway session, no prior setup needed |
+| `grokmate message <text>` | Send a message and print Grok's response | `--one-shot` — throwaway session, no prior setup needed; `--timeout` / `-t` — seconds to wait for response (default: 120) |
 
 ## How It Works
 

@@ -84,6 +84,34 @@ class TestMessage:
         assert result.exit_code == 0
         assert "Grok says hi" in result.output
 
+    @patch("grokmate.grok.extract_full_response", return_value="timeout response")
+    @patch("grokmate.grok.send_message")
+    @patch("grokmate.grok.connect_device")
+    @patch("grokmate.grok.tap_new_chat")
+    @patch("grokmate.adb.launch_grok")
+    @patch("grokmate.adb.get_connected_device")
+    def test_message_custom_timeout_is_passed_through(
+        self,
+        mock_device: MagicMock,
+        mock_launch: MagicMock,
+        mock_new_chat: MagicMock,
+        mock_connect: MagicMock,
+        mock_send: MagicMock,
+        mock_response: MagicMock,
+    ) -> None:
+        from grokmate.adb import DeviceInfo
+
+        mock_device.return_value = DeviceInfo(serial="R5CR1234", state="device")
+
+        result = runner.invoke(
+            cli.app, ["message", "hello", "--one-shot", "--timeout", "300"]
+        )
+        assert result.exit_code == 0
+        assert "timeout response" in result.output
+        mock_response.assert_called_once()
+        _, kwargs = mock_response.call_args
+        assert kwargs["timeout"] == 300
+
     @patch("grokmate.grok.extract_full_response", return_value="response text")
     @patch("grokmate.grok.send_message")
     @patch("grokmate.grok.connect_device")
